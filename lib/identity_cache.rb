@@ -39,6 +39,7 @@ module IdentityCache
   class UnsupportedScopeError < StandardError; end
   class UnsupportedAssociationError < StandardError; end
   class DerivedModelError < StandardError; end
+  class LockWaitTimeout < StandardError; end
 
   class << self
     include IdentityCache::CacheHash
@@ -100,9 +101,11 @@ module IdentityCache
     # == Parameters
     # +key+ A cache key string
     #
-    def fetch(key)
+    def fetch(key, cache_fetcher_options = {})
       if should_use_cache?
-        unmap_cached_nil_for(cache.fetch(key) { map_cached_nil_for yield })
+        unmap_cached_nil_for(cache.fetch(key, cache_fetcher_options) do
+          map_cached_nil_for yield
+        end)
       else
         yield
       end

@@ -1,6 +1,55 @@
+# frozen_string_literal: true
+
+require 'securerandom'
+
 module IdentityCache
   class CacheFetcher
     attr_accessor :cache_backend
+
+    class FillLock
+      FILL_LOCKED = :fill_locked
+      FAILED_CLIENT_ID = 'fill_failed'
+
+      class << self
+        private :new
+
+        def build(client_id:, data_version:)
+          new([FILL_LOCKED, client_id, data_version])
+        end
+
+        def from_cache(cache_value)
+          raise ArgumentError unless cache_value?(cache_value)
+          new(cache_value)
+        end
+
+        def cache_value?(cache_value)
+          cache_value.is_a?(Array) && cache_value.length == 3 && cache_value.first == FILL_LOCKED
+        end
+      end
+
+      attr_reader :client_id, :data_version, :cache_value
+
+      def initialize(cache_value)
+        @cache_value = cache_value
+        _, @client_id, @data_version = cache_value
+      end
+
+      def mark_failed
+        @cache_value[1] = @client_id = FAILED_CLIENT_ID
+      end
+
+      def fill_failed?
+        @client_id == FAILED_CLIENT_ID
+      end
+
+      def equals_cache_value?(cache_value)
+        @cache_value == cache_value
+      end
+
+      def ==(other)
+        self.class == other.class && cache_value == other.cache_value
+      end
+    end
 
     def initialize(cache_backend)
       @cache_backend = cache_backend
@@ -24,27 +73,183 @@ module IdentityCache
       results
     end
 
-    def fetch(key)
-      result = nil
-      yielded = false
-      @cache_backend.cas(key) do |value|
-        yielded = true
-        unless IdentityCache::DELETED == value
-          result = value
-          break
-        end
-        result = yield
-        break unless IdentityCache.should_fill_cache?
-        result
+    def fetch(key, **cache_options)
+      if use_fill_lock?(cache_options)
+        fetch_with_fill_lock(key, cache_options) { yield }
+      else
+        fetch_without_fill_lock(key) { yield }
       end
-      unless yielded
-        result = yield
-        add(key, result)
-      end
-      result
     end
 
     private
+
+    def use_fill_lock?(fill_lock_duration: nil, lock_wait_limit: nil)
+      fill_lock_duration && IdentityCache.should_fill_cache?
+    end
+
+    def fetch_without_fill_lock(key)
+      data = nil
+      cas_or_add(key) do |value|
+        value = nil if value == IdentityCache::DELETED || FillLock.cache_value?(value)
+        unless value.nil?
+          return value
+        end
+        data = yield
+        break unless IdentityCache.should_fill_cache?
+        data
+      end
+      data
+    end
+
+    def fetch_with_fill_lock(key, fill_lock_duration:, lock_wait_limit: 2)
+      raise ArgumentError unless fill_lock_duration > 0.0 || lock_wait_limit > 0
+      lock = nil
+      using_fallback_key = false
+      expires_in = nil
+      (lock_wait_limit + 2).times do
+        result = fetch_or_take_lock(key, old_lock: lock, expires_in: expires_in)
+        case result
+        when FillLock
+          lock = result
+          if lock.client_id == client_id # have lock
+            data = begin
+              yield
+            rescue Exception
+              @cache_backend.cas(key, expires_in: expires_in) do |value|
+                break unless FillLock.cache_value?(value)
+                lock = FillLock.from_cache(value)
+                lock.mark_failed
+                lock.cache_value
+              end
+              raise
+            end
+
+            unless fill_with_lock(key, data, lock, expires_in: expires_in)
+              unless using_fallback_key
+                # fallback to storing data in the fallback key so it is available to clients waiting on the lock
+                expires_in = fallback_key_expires_in(fill_lock_duration)
+                @cache_backend.write(lock_fill_fallback_key(key, lock), data, expires_in: expires_in)
+              end
+            end
+            return data
+          else
+            raise LockWaitTimeout if lock_wait_limit <= 0
+            lock_wait_limit -= 1
+
+            # If fill failed in the other client, then it might be failing fast
+            # so avoid waiting the typical amount of time for a lock wait. The
+            # semian gem can be used to handle failing fast when the database is slow.
+            if lock.fill_failed?
+              return fetch_without_fill_lock(key) { yield }
+            end
+
+            # lock wait
+            sleep(fill_lock_duration)
+            # loop around to retry fetch_or_take_lock
+          end
+        when IdentityCache::DELETED # interrupted by cache invalidation
+          if lock && !using_fallback_key
+            # cache invalidated during lock wait, try fallback key
+            using_fallback_key = true
+            key = lock_fill_fallback_key(key, lock)
+            # Use lower TTL for fallback key lock since it won't be used for very long.
+            expires_in = fill_lock_duration * 2
+            # Memcached uses integer number of seconds for TTL so round up to avoid having
+            # the cache store round down with `to_i`.
+            expires_in = expires_in.ceil
+            # Memcached only uses part of the first second of the TTL, so add 1 to compensate.
+            expires_in += 1
+            next
+          else
+            # cache invalidation prevented lock from being taken
+            return yield
+          end
+        when nil # Errors talking to memcached
+          return yield
+        else # hit
+          return result
+        end
+      end
+      raise "unexpected number of loop iterations"
+    end
+
+    def cas_or_add(key, expires_in: nil)
+      yielded = false
+      swapped = @cache_backend.cas(key, expires_in: expires_in) do |value|
+        yielded = true
+        yield value
+      end
+      unless yielded
+        data = yield nil
+        swapped = add(key, data, expires_in: expires_in)
+      end
+      swapped
+    end
+
+    def fetch_or_take_lock(key, old_lock:, expires_in:)
+      new_lock = nil
+      swapped = cas_or_add(key, expires_in: expires_in) do |value|
+        if value.nil? || value == IdentityCache::DELETED
+          if old_lock # cache invalidated
+            return value
+          else
+            new_lock = FillLock.build(client_id: client_id, data_version: SecureRandom.uuid)
+          end
+        elsif FillLock.cache_value?(value)
+          if old_lock && old_lock.equals_cache_value?(value)
+            # preserve data version since there hasn't been any cache invalidations
+            new_lock = FillLock.build(client_id: client_id, data_version: old_lock.data_version)
+          else
+            return FillLock.from_cache(value)
+          end
+        else # hit
+          return value
+        end
+        new_lock.cache_value # take lock
+      end
+
+      return new_lock if swapped
+
+      value = @cache_backend.read(key)
+      if FillLock.cache_value?(value)
+        FillLock.from_cache(value)
+      else
+        value
+      end
+    end
+
+    def fill_with_lock(key, data, my_lock, expires_in:)
+      swapped = cas_or_add(key, expires_in: expires_in) do |value|
+        return false if value.nil? || value == IdentityCache::DELETED
+        return true unless FillLock.cache_value?(value) # already filled
+        current_lock = FillLock.from_cache(value)
+        if current_lock.data_version != my_lock.data_version
+          return false # invalidated then relocked
+        end
+        data
+      end
+
+      swapped
+    end
+
+    def lock_fill_fallback_key(key, lock)
+      "lock_fill:#{lock.data_version}:#{key}"
+    end
+
+    def fallback_key_expires_in(fill_lock_duration)
+      expires_in = fill_lock_duration * 2
+
+      # memcached uses integer number of seconds for TTL so round up to avoid having
+      # the cache store round down with `to_i`
+      expires_in = expires_in.ceil
+
+      # memcached TTL only gets part of the first second, so increase TTL by 1 to compensate
+      expires_in + 1
+    end
+
+    def client_id
+      @client_id ||= SecureRandom.uuid
+    end
 
     def cas_multi(keys)
       result = nil
@@ -80,8 +285,9 @@ module IdentityCache
       result.each {|k, v| add(k, v) }
     end
 
-    def add(key, value)
-      @cache_backend.write(key, value, :unless_exist => true) if IdentityCache.should_fill_cache?
+    def add(key, value, expires_in: nil)
+      return unless IdentityCache.should_fill_cache?
+      @cache_backend.write(key, value, unless_exist: true, expires_in: expires_in)
     end
   end
 end

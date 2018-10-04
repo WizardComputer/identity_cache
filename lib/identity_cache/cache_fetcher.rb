@@ -6,6 +6,8 @@ module IdentityCache
   class CacheFetcher
     attr_accessor :cache_backend
 
+    EMPTY_HASH = {}.freeze
+
     class FillLock
       FILL_LOCKED = :fill_locked
       FAILED_CLIENT_ID = 'fill_failed'
@@ -106,9 +108,9 @@ module IdentityCache
       raise ArgumentError, 'lock_wait_limit must be greater than 0' unless lock_wait_limit > 0
       lock = nil
       using_fallback_key = false
-      expires_in = nil
+      expiration_options = EMPTY_HASH
       (lock_wait_limit + 2).times do
-        result = fetch_or_take_lock(key, old_lock: lock, expires_in: expires_in)
+        result = fetch_or_take_lock(key, old_lock: lock, **expiration_options)
         case result
         when FillLock
           lock = result
@@ -116,7 +118,7 @@ module IdentityCache
             data = begin
               yield
             rescue Exception
-              @cache_backend.cas(key, expires_in: expires_in) do |value|
+              @cache_backend.cas(key, **expiration_options) do |value|
                 break unless FillLock.cache_value?(value)
                 lock = FillLock.from_cache(value)
                 lock.mark_failed
@@ -125,11 +127,11 @@ module IdentityCache
               raise
             end
 
-            unless fill_with_lock(key, data, lock, expires_in: expires_in)
+            unless fill_with_lock(key, data, lock, expiration_options)
               unless using_fallback_key
                 # fallback to storing data in the fallback key so it is available to clients waiting on the lock
-                expires_in = fallback_key_expires_in(fill_lock_duration)
-                @cache_backend.write(lock_fill_fallback_key(key, lock), data, expires_in: expires_in)
+                expiration_options = fallback_key_expiration_options(fill_lock_duration)
+                @cache_backend.write(lock_fill_fallback_key(key, lock), data, **expiration_options)
               end
             end
             return data
@@ -153,13 +155,7 @@ module IdentityCache
             # cache invalidated during lock wait, try fallback key
             using_fallback_key = true
             key = lock_fill_fallback_key(key, lock)
-            # Use lower TTL for fallback key lock since it won't be used for very long.
-            expires_in = fill_lock_duration * 2
-            # Memcached uses integer number of seconds for TTL so round up to avoid having
-            # the cache store round down with `to_i`.
-            expires_in = expires_in.ceil
-            # Memcached only uses part of the first second of the TTL, so add 1 to compensate.
-            expires_in += 1
+            expiration_options = fallback_key_expiration_options(fill_lock_duration)
             next
           else
             # cache invalidation prevented lock from being taken
@@ -174,22 +170,22 @@ module IdentityCache
       raise "unexpected number of loop iterations"
     end
 
-    def cas_or_add(key, expires_in: nil)
+    def cas_or_add(key, expiration_options = EMPTY_HASH)
       yielded = false
-      swapped = @cache_backend.cas(key, expires_in: expires_in) do |value|
+      swapped = @cache_backend.cas(key, expiration_options) do |value|
         yielded = true
         yield value
       end
       unless yielded
         data = yield nil
-        swapped = add(key, data, expires_in: expires_in)
+        swapped = add(key, data, expiration_options)
       end
       swapped
     end
 
-    def fetch_or_take_lock(key, old_lock:, expires_in:)
+    def fetch_or_take_lock(key, old_lock:, **expiration_options)
       new_lock = nil
-      swapped = cas_or_add(key, expires_in: expires_in) do |value|
+      swapped = cas_or_add(key, expiration_options) do |value|
         if value.nil? || value == IdentityCache::DELETED
           if old_lock # cache invalidated
             return value
@@ -219,8 +215,8 @@ module IdentityCache
       end
     end
 
-    def fill_with_lock(key, data, my_lock, expires_in:)
-      swapped = cas_or_add(key, expires_in: expires_in) do |value|
+    def fill_with_lock(key, data, my_lock, expiration_options)
+      swapped = cas_or_add(key, expiration_options) do |value|
         return false if value.nil? || value == IdentityCache::DELETED
         return true unless FillLock.cache_value?(value) # already filled
         current_lock = FillLock.from_cache(value)
@@ -237,7 +233,8 @@ module IdentityCache
       "lock_fill:#{lock.data_version}:#{key}"
     end
 
-    def fallback_key_expires_in(fill_lock_duration)
+    def fallback_key_expiration_options(fill_lock_duration)
+      # Use lower TTL for fallback key lock since it won't be used for very long.
       expires_in = fill_lock_duration * 2
 
       # memcached uses integer number of seconds for TTL so round up to avoid having
@@ -246,6 +243,8 @@ module IdentityCache
 
       # memcached TTL only gets part of the first second, so increase TTL by 1 to compensate
       expires_in + 1
+
+      { expires_in: expires_in }
     end
 
     def client_id
@@ -286,9 +285,9 @@ module IdentityCache
       result.each {|k, v| add(k, v) }
     end
 
-    def add(key, value, expires_in: nil)
+    def add(key, value, **expiration_options)
       return unless IdentityCache.should_fill_cache?
-      @cache_backend.write(key, value, unless_exist: true, expires_in: expires_in)
+      @cache_backend.write(key, value, unless_exist: true, **expiration_options)
     end
   end
 end

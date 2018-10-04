@@ -150,7 +150,7 @@ class FetchTest < IdentityCache::TestCase
 
     assert_equal @record, Item.fetch(1)
     assert resolve_cache_miss.has_been_called_with?(1)
-    assert write.has_been_called_with?(@blob_key, @cached_value, unless_exist: true, expires_in: nil)
+    assert write.has_been_called_with?(@blob_key, @cached_value, unless_exist: true)
     assert_equal IdentityCache::DELETED, backend.read(@record.primary_cache_index_key)
   end
 
@@ -172,14 +172,14 @@ class FetchTest < IdentityCache::TestCase
 
   def test_fetch_by_id_not_found_should_return_nil
     nonexistent_record_id = 10
-    fetcher.expects(:add).with(@blob_key + '0', IdentityCache::CACHED_NIL, expires_in: nil)
+    fetcher.expects(:add).with(@blob_key + '0', IdentityCache::CACHED_NIL, {})
 
     assert_nil Item.fetch_by_id(nonexistent_record_id)
   end
 
   def test_fetch_not_found_should_raise
     nonexistent_record_id = 10
-    fetcher.expects(:add).with(@blob_key + '0', IdentityCache::CACHED_NIL, expires_in: nil)
+    fetcher.expects(:add).with(@blob_key + '0', IdentityCache::CACHED_NIL, {})
 
     assert_raises(ActiveRecord::RecordNotFound) { Item.fetch(nonexistent_record_id) }
   end

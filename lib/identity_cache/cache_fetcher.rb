@@ -102,7 +102,8 @@ module IdentityCache
     end
 
     def fetch_with_fill_lock(key, fill_lock_duration:, lock_wait_limit: 2)
-      raise ArgumentError unless fill_lock_duration > 0.0 || lock_wait_limit > 0
+      raise ArgumentError, 'fill_lock_duration must be greater than 0.0' unless fill_lock_duration > 0.0
+      raise ArgumentError, 'lock_wait_limit must be greater than 0' unless lock_wait_limit > 0
       lock = nil
       using_fallback_key = false
       expires_in = nil

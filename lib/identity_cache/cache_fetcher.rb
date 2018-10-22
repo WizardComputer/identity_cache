@@ -107,7 +107,7 @@ module IdentityCache
       lock = nil
       using_fallback_key = false
       expiration_options = EMPTY_HASH
-      (lock_wait_limit + 2).times do
+      (lock_wait_limit + 2).times do # +2 is for first attempt and retry with fallback key
         result = fetch_or_take_lock(key, old_lock: lock, **expiration_options)
         case result
         when FillLock

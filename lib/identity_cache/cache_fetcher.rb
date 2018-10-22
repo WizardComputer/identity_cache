@@ -156,7 +156,7 @@ module IdentityCache
             using_fallback_key = true
             key = lock_fill_fallback_key(key, lock)
             expiration_options = fallback_key_expiration_options(fill_lock_duration)
-            next
+            # loop around to retry with fallback key
           else
             # cache invalidation prevented lock from being taken
             return yield

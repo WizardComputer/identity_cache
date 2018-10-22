@@ -115,7 +115,7 @@ module IdentityCache
           if lock.client_id == client_id # have lock
             data = begin
               yield
-            rescue Exception
+            rescue
               @cache_backend.cas(key, **expiration_options) do |value|
                 break unless FillLock.cache_value?(value)
                 lock = FillLock.from_cache(value)

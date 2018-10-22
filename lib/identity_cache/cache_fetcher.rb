@@ -75,19 +75,17 @@ module IdentityCache
       results
     end
 
-    def fetch(key, **cache_options)
-      if use_fill_lock?(cache_options)
-        fetch_with_fill_lock(key, cache_options) { yield }
+    def fetch(key, fill_lock_duration: nil, lock_wait_limit: 2)
+      if fill_lock_duration && IdentityCache.should_fill_cache?
+        fetch_with_fill_lock(key, fill_lock_duration, lock_wait_limit) do
+          yield
+        end
       else
         fetch_without_fill_lock(key) { yield }
       end
     end
 
     private
-
-    def use_fill_lock?(fill_lock_duration: nil, lock_wait_limit: nil)
-      fill_lock_duration && IdentityCache.should_fill_cache?
-    end
 
     def fetch_without_fill_lock(key)
       data = nil
@@ -103,7 +101,7 @@ module IdentityCache
       data
     end
 
-    def fetch_with_fill_lock(key, fill_lock_duration:, lock_wait_limit: 2)
+    def fetch_with_fill_lock(key, fill_lock_duration, lock_wait_limit)
       raise ArgumentError, 'fill_lock_duration must be greater than 0.0' unless fill_lock_duration > 0.0
       raise ArgumentError, 'lock_wait_limit must be greater than 0' unless lock_wait_limit > 0
       lock = nil
